@@ -1,0 +1,580 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Seating Map Tool</title>
+  <script src="https://unpkg.com/konva@9/konva.min.js"></script>
+
+  <style>
+    body{margin:0;font-family:system-ui;background:#f6f6f7;}
+    .wrap{display:grid;grid-template-columns:340px 1fr;height:100vh;}
+    .panel{padding:12px;background:white;border-right:1px solid #ddd;overflow:auto;}
+    h3{margin:12px 0 6px 0;}
+    button, select, textarea, input{
+      margin:4px; padding:8px 10px; border-radius:10px; border:1px solid #ccc; background:white;
+      font:inherit;
+    }
+    button:active{transform:translateY(1px);}
+    textarea{width:100%; min-height:120px; resize:vertical; font: 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;}
+    #stage{background:white;border:1px solid #ccc;margin:10px;border-radius:12px; width: calc(100% - 20px); height: calc(100vh - 20px);}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0;}
+    .row > *{flex:0 0 auto;}
+    .hint{font-size:12px;opacity:.75;line-height:1.35;margin:4px 0 10px;}
+    .danger{border-color:#e1b0b0;}
+    .primary{background:#111;color:#fff;border-color:#111;}
+    .primary:hover{background:#222;}
+    .small{padding:6px 8px;font-size:13px;}
+    .mono{font: 12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;}
+    .linkbox{width:100%;}
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <h3>Classes</h3>
+      <div class="row">
+        <select id="classSelect" style="max-width:210px;"></select>
+        <button id="newClass" class="small">New</button>
+      </div>
+      <div class="row">
+        <button id="renameClass" class="small">Rename</button>
+        <button id="deleteClass" class="small danger">Delete</button>
+      </div>
+      <div class="hint">Auto-saves on this device/browser. To open the same class on another browser/device, use <b>Share Link</b> below.</div>
+
+      <h3>Names</h3>
+      <div class="hint">One name per line. Use <b>Create desks</b> to generate desks automatically, or <b>Apply names</b> to fill existing desks.</div>
+      <textarea id="namesBox" placeholder="Isabella\nLucas Flores\nMaria Eduarda\n..."></textarea>
+      <div class="row">
+        <button id="createDesks" class="primary">Create desks</button>
+        <button id="applyNames">Apply names</button>
+        <button id="clearNames" class="small">Clear</button>
+      </div>
+
+      <h3>Layouts</h3>
+      <div class="hint">Layouts rearrange desks only (room items stay where you put them).</div>
+      <div class="row">
+        <button id="layoutRows" class="small">Rows</button>
+        <button id="layoutPods" class="small">Pods (4)</button>
+        <button id="layoutPairs" class="small">Pairs</button>
+        <button id="layoutU" class="small">U-shape</button>
+      </div>
+
+      <h3>Items</h3>
+      <div class="row">
+        <button id="addDesk" class="small">Add Desk</button>
+        <button id="addWindow" class="small">Window</button>
+        <button id="addDoor" class="small">Door</button>
+        <button id="addBoard" class="small">Board</button>
+        <button id="addTeacher" class="small">Teacher Desk</button>
+      </div>
+
+      <h3>Share</h3>
+      <div class="hint">Creates a link that opens this class on other browsers/devices. (No account needed.)</div>
+      <div class="row">
+        <button id="shareLink" class="primary">Share Link</button>
+        <button id="copyLink" class="small">Copy</button>
+      </div>
+      <input id="shareUrl" class="linkbox mono" readonly placeholder="Tap Share Link to generate..." />
+
+      <h3>Selected item</h3>
+      <div class="row">
+        <button id="bringFront" class="small">Bring to front</button>
+        <button id="sendBack" class="small">Send to back</button>
+        <button id="deleteItem" class="small danger">Delete item</button>
+      </div>
+      <div class="hint">Tip: double-tap an item to rename it.</div>
+    </div>
+
+    <div id="stage"></div>
+  </div>
+
+<script>
+  // ---------------- Stage ----------------
+  const STAGE_W = 1400;
+  const STAGE_H = 850;
+
+  const stage = new Konva.Stage({ container:"stage", width:STAGE_W, height:STAGE_H });
+  const layer = new Konva.Layer();
+  stage.add(layer);
+
+  const tr = new Konva.Transformer({ rotateEnabled:false });
+  layer.add(tr);
+
+  function select(node){ tr.nodes([node]); layer.draw(); }
+  function deselect(){ tr.nodes([]); layer.draw(); }
+  function selectedNode(){ return tr.nodes()[0] || null; }
+
+  // ------------- Autosave debounce -------------
+  let autosaveTimer = null;
+  function scheduleAutosave(){
+    const active = getActiveId();
+    if (!active) return;
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(() => {
+      try { saveClass(active); } catch(e) {}
+    }, 350);
+  }
+
+  // ---------------- Rename ----------------
+  function renameItem(group){
+    const texts = group.find('Text');
+    const labelNode = (group.getAttr('type') === 'desk') ? texts[0] : (texts[1] || texts[0]);
+    const next = prompt("Rename:", labelNode.text());
+    if(next !== null && next !== undefined){
+      const cleaned = String(next).trim();
+      if (cleaned) labelNode.text(cleaned);
+      layer.draw();
+      scheduleAutosave();
+    }
+  }
+
+  // ---------------- Icons ----------------
+  function makeIconCard({emoji,label,x=100,y=100,fill="#fff",type="item"}){
+    const group = new Konva.Group({ x, y, draggable:true, name:"item", attrs:{ type } });
+
+    const rect = new Konva.Rect({ width:170, height:90, cornerRadius:16, fill, stroke:"#111" });
+    const icon = new Konva.Text({ text:emoji, fontSize:28, x:12, y:20 });
+    const text = new Konva.Text({ text:label, fontSize:16, fontStyle:"bold", x:50, y:32, width:110, align:"center" });
+
+    group.add(rect, icon, text);
+
+    group.on("click tap", (e) => { select(group); e.cancelBubble = true; });
+    group.on("dblclick dbltap", () => renameItem(group));
+    group.on("dragend", () => scheduleAutosave());
+
+    layer.add(group); layer.draw();
+    return group;
+  }
+
+  function makeDeskCard({label="Student",x=100,y=100,fill="#fff"}){
+    const group = new Konva.Group({ x, y, draggable:true, name:"item", attrs:{ type:"desk" } });
+
+    const card = new Konva.Rect({ width:180, height:100, cornerRadius:16, fill, stroke:"#111" });
+
+    // Long tabletop
+    const tableTop = new Konva.Rect({ x:12, y:18, width:74, height:16, cornerRadius:4, fill:"#caa46a", stroke:"#111" });
+    const tableLeg1 = new Konva.Rect({ x:16, y:34, width:6, height:28, fill:"#b68a52", stroke:"#111" });
+    const tableLeg2 = new Konva.Rect({ x:76, y:34, width:6, height:28, fill:"#b68a52", stroke:"#111" });
+
+    // Chair tucked under
+    const chairBack = new Konva.Rect({ x:46, y:34, width:10, height:16, cornerRadius:3, fill:"#8bb7e0", stroke:"#111" });
+    const chairSeat = new Konva.Rect({ x:42, y:46, width:22, height:10, cornerRadius:3, fill:"#8bb7e0", stroke:"#111" });
+    const chairLeg = new Konva.Rect({ x:48, y:56, width:5, height:12, fill:"#6a9dc7", stroke:"#111" });
+
+    const text = new Konva.Text({ text:label, fontSize:16, fontStyle:"bold", x:95, y:34, width:70, align:"center" });
+
+    group.add(card, tableTop, tableLeg1, tableLeg2, chairBack, chairSeat, chairLeg, text);
+
+    group.on("click tap", (e) => { select(group); e.cancelBubble = true; });
+    group.on("dblclick dbltap", () => renameItem(group));
+    group.on("dragend", () => scheduleAutosave());
+
+    layer.add(group); layer.draw();
+    return group;
+  }
+
+  // ---------------- Canvas helpers ----------------
+  function allItems(){ return layer.find('.item'); }
+  function desks(){ return allItems().filter(g => g.getAttr('type') === 'desk'); }
+
+  function clearDesksOnly(){
+    deselect();
+    desks().forEach(d => d.destroy());
+    layer.draw();
+  }
+
+  function ensureRoomItems(){
+    const hasType = (t) => allItems().some(g => g.getAttr('type') === t);
+    if (!hasType('window')) makeIconCard({emoji:"🪟", label:"WINDOW", x:220, y:120, fill:"#c8dcff", type:"window"});
+    if (!hasType('door')) makeIconCard({emoji:"🚪", label:"DOOR", x:220, y:260, fill:"#ffdcdc", type:"door"});
+    if (!hasType('board')) makeIconCard({emoji:"📋", label:"BOARD", x:220, y:360, fill:"#c8ffd3", type:"board"});
+    if (!hasType('teacher')) makeIconCard({emoji:"🧑‍🏫", label:"TEACHER", x:220, y:460, fill:"#ffe6c8", type:"teacher"});
+  }
+
+  // ---------------- Names helpers ----------------
+  function parseNames(){
+    return document.getElementById("namesBox").value
+      .split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  }
+
+  function applyNamesToExistingDesks(){
+    const names = parseNames();
+    const ds = desks().slice().sort((a,b)=> (a.y()-b.y()) || (a.x()-b.x()));
+    ds.forEach((d, i) => {
+      const t = d.find('Text')[0];
+      if (t && names[i]) t.text(names[i]);
+    });
+    layer.draw();
+    scheduleAutosave();
+  }
+
+  function createDesksFromNames(){
+    const names = parseNames();
+    const count = Math.max(names.length, 1);
+    clearDesksOnly();
+    ensureRoomItems();
+
+    // create in rows initially
+    const cols = 6;
+    const startX = 140, startY = 160;
+    const xGap = 190, yGap = 130;
+
+    for (let i=0;i<count;i++){
+      const r = Math.floor(i/cols), c = i%cols;
+      makeDeskCard({ label: names[i] || "Student", x: startX + c*xGap, y: startY + r*yGap, fill:"#fff" });
+    }
+    layer.draw();
+    scheduleAutosave();
+  }
+
+  // ---------------- Layout engines ----------------
+  function layoutRows(){
+    const ds = desks();
+    if (!ds.length) return;
+    const cols = 6;
+    const startX = 140, startY = 160;
+    const xGap = 190, yGap = 130;
+    ds.forEach((d, i) => {
+      const r = Math.floor(i/cols), c = i%cols;
+      d.position({ x: startX + c*xGap, y: startY + r*yGap });
+    });
+    layer.draw();
+    scheduleAutosave();
+  }
+
+  function layoutPods(){
+    const ds = desks();
+    if (!ds.length) return;
+    const podSize = 4;
+    const podGapX = 420, podGapY = 320;
+    const baseX = 260, baseY = 220;
+    const offsets = [
+      {dx:-110, dy:-70},
+      {dx:  30, dy:-70},
+      {dx:-110, dy: 20},
+      {dx:  30, dy: 20},
+    ];
+    ds.forEach((d, i) => {
+      const pod = Math.floor(i/podSize);
+      const slot = i % podSize;
+      const px = baseX + (pod % 3) * podGapX;
+      const py = baseY + Math.floor(pod/3) * podGapY;
+      d.position({ x: px + offsets[slot].dx, y: py + offsets[slot].dy });
+    });
+    layer.draw();
+    scheduleAutosave();
+  }
+
+  function layoutPairs(){
+    const ds = desks();
+    if (!ds.length) return;
+    const pairGapX = 260;
+    const pairGapY = 160;
+    const baseX = 220, baseY = 200;
+    const offsets = [
+      {dx:-90, dy:0},
+      {dx: 20, dy:0},
+    ];
+    ds.forEach((d, i) => {
+      const pair = Math.floor(i/2);
+      const slot = i % 2;
+      const px = baseX + (pair % 4) * pairGapX;
+      const py = baseY + Math.floor(pair/4) * pairGapY;
+      d.position({ x: px + offsets[slot].dx, y: py + offsets[slot].dy });
+    });
+    layer.draw();
+    scheduleAutosave();
+  }
+
+  function layoutU(){
+    const ds = desks();
+    if (!ds.length) return;
+    const leftX = 180, rightX = 1040, topY = 170, bottomY = 640;
+    const sideCount = Math.max(4, Math.ceil(ds.length/3));
+    const topCount = ds.length - 2*sideCount;
+    let idx = 0;
+    for (let i=0;i<sideCount && idx<ds.length;i++,idx++){
+      const y = topY + i*((bottomY-topY)/(Math.max(2, sideCount-1)));
+      ds[idx].position({ x:leftX, y });
+    }
+    for (let i=0;i<Math.max(0, topCount) && idx<ds.length;i++,idx++){
+      const x = leftX + 160 + i*120;
+      ds[idx].position({ x, y: topY-20 });
+    }
+    for (let i=0;i<sideCount && idx<ds.length;i++,idx++){
+      const y = topY + i*((bottomY-topY)/(Math.max(2, sideCount-1)));
+      ds[idx].position({ x:rightX, y });
+    }
+    layer.draw();
+    scheduleAutosave();
+  }
+
+  // ---------------- Serialize / Load ----------------
+  function serialize(){
+    const items = allItems().map(g => {
+      const outerRect = g.findOne('Rect');
+      const type = g.getAttr('type') || 'item';
+      const fill = outerRect ? outerRect.fill() : "#fff";
+      if (type === 'desk') {
+        const label = (g.find('Text')[0] || {text:()=> "Student"}).text();
+        return { type, x:g.x(), y:g.y(), fill, label };
+      } else {
+        const texts = g.find('Text');
+        const emoji = (texts[0] ? texts[0].text() : "");
+        const label = (texts[1] ? texts[1].text() : (texts[0] ? texts[0].text() : "ITEM"));
+        return { type, x:g.x(), y:g.y(), fill, emoji, label };
+      }
+    });
+    return { version: 2, stage: { w: stage.width(), h: stage.height() }, items, meta: { name: currentClassName() } };
+  }
+
+  function loadFrom(data){
+    deselect();
+    allItems().forEach(n => n.destroy());
+    if (!data || !Array.isArray(data.items)) { ensureRoomItems(); layer.draw(); return; }
+    data.items.forEach(it => {
+      if (it.type === 'desk') {
+        makeDeskCard({ label: it.label || "Student", x: it.x ?? 100, y: it.y ?? 100, fill: it.fill || "#fff" });
+      } else {
+        makeIconCard({ emoji: it.emoji || "⬛", label: it.label || "ITEM", x: it.x ?? 100, y: it.y ?? 100, fill: it.fill || "#fff", type: it.type || "item" });
+      }
+    });
+    layer.draw();
+  }
+
+  // ---------------- Classes (localStorage) ----------------
+  const LS_INDEX_KEY = "seatingmap:classes:index";
+  const LS_ACTIVE_KEY = "seatingmap:classes:active";
+  const LS_CLASS_KEY = (id) => `seatingmap:class:${id}`;
+
+  function uid(){ return "c_" + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
+  function loadIndex(){ try { return JSON.parse(localStorage.getItem(LS_INDEX_KEY)) || []; } catch(e){ return []; } }
+  function saveIndex(idx){ localStorage.setItem(LS_INDEX_KEY, JSON.stringify(idx)); }
+  function getActiveId(){ return localStorage.getItem(LS_ACTIVE_KEY); }
+  function setActiveId(id){ localStorage.setItem(LS_ACTIVE_KEY, id); }
+  function saveClass(id){ localStorage.setItem(LS_CLASS_KEY(id), JSON.stringify(serialize())); }
+  function loadClass(id){ const raw = localStorage.getItem(LS_CLASS_KEY(id)); if(!raw) return null; try { return JSON.parse(raw); } catch(e){ return null; } }
+
+  function currentClassName(){
+    const idx = loadIndex();
+    const active = getActiveId();
+    const entry = idx.find(c => c.id === active);
+    return entry ? entry.name : "Class";
+  }
+
+  function populateClassSelect(){
+    const sel = document.getElementById("classSelect");
+    const idx = loadIndex();
+    const active = getActiveId();
+    sel.innerHTML = "";
+    idx.forEach(({id,name}) => {
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = name;
+      if (id === active) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }
+
+  function ensureAtLeastOneClass(){
+    let idx = loadIndex();
+    let active = getActiveId();
+    if (!idx.length) {
+      const id = uid();
+      idx = [{ id, name: "Class 1" }];
+      saveIndex(idx);
+      setActiveId(id);
+      ensureRoomItems();
+      saveClass(id);
+    } else if (!active || !idx.some(c => c.id === active)) {
+      setActiveId(idx[0].id);
+    }
+  }
+
+  function switchToClass(id){
+    const current = getActiveId();
+    if (current) { try { saveClass(current); } catch(e) {} }
+    const data = loadClass(id);
+    if (data) loadFrom(data);
+    else { ensureRoomItems(); saveClass(id); }
+    setActiveId(id);
+    populateClassSelect();
+  }
+
+  // ---------------- Share link (cross-browser) ----------------
+  function b64urlEncode(uint8arr){
+    let bin = '';
+    uint8arr.forEach(b => bin += String.fromCharCode(b));
+    return btoa(bin).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  }
+  function b64urlDecode(str){
+    str = str.replace(/-/g,'+').replace(/_/g,'/');
+    while (str.length % 4) str += '=';
+    const bin = atob(str);
+    const bytes = new Uint8Array(bin.length);
+    for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  async function generateShareLink(){
+    const payload = serialize();
+    if ('CompressionStream' in window) {
+      const cs = new CompressionStream('gzip');
+      const blob = new Blob([new TextEncoder().encode(JSON.stringify(payload))]);
+      const stream = blob.stream().pipeThrough(cs);
+      const compressed = new Uint8Array(await new Response(stream).arrayBuffer());
+      return location.origin + location.pathname + "#v2." + b64urlEncode(compressed);
+    } else {
+      const enc = new TextEncoder().encode(JSON.stringify(payload));
+      return location.origin + location.pathname + "#v1." + b64urlEncode(enc);
+    }
+  }
+
+  async function importFromHashIfPresent(){
+    const h = (location.hash || "").slice(1);
+    if (!h) return false;
+    try {
+      if (h.startsWith("v2.")) {
+        const bytes = b64urlDecode(h.slice(3));
+        const ds = new DecompressionStream('gzip');
+        const stream = new Blob([bytes]).stream().pipeThrough(ds);
+        const text = await new Response(stream).text();
+        const payload = JSON.parse(text);
+        importAsNewClass(payload);
+        return true;
+      }
+      if (h.startsWith("v1.")) {
+        const bytes = b64urlDecode(h.slice(3));
+        const text = new TextDecoder().decode(bytes);
+        const payload = JSON.parse(text);
+        importAsNewClass(payload);
+        return true;
+      }
+    } catch(e) {
+      console.warn("Could not import from link:", e);
+    }
+    return false;
+  }
+
+  function importAsNewClass(payload){
+    const name = (payload && payload.meta && payload.meta.name) ? payload.meta.name : "Imported Class";
+    const idx = loadIndex();
+    const id = uid();
+    idx.push({ id, name });
+    saveIndex(idx);
+    setActiveId(id);
+    loadFrom(payload);
+    saveClass(id);
+    populateClassSelect();
+    history.replaceState(null, "", location.pathname);
+    scheduleAutosave();
+  }
+
+  // ---------------- UI wiring ----------------
+  document.getElementById("createDesks").onclick = () => createDesksFromNames();
+  document.getElementById("applyNames").onclick = () => applyNamesToExistingDesks();
+  document.getElementById("clearNames").onclick = () => { document.getElementById("namesBox").value = ""; };
+
+  document.getElementById("layoutRows").onclick = () => layoutRows();
+  document.getElementById("layoutPods").onclick = () => layoutPods();
+  document.getElementById("layoutPairs").onclick = () => layoutPairs();
+  document.getElementById("layoutU").onclick = () => layoutU();
+
+  document.getElementById("addDesk").onclick = () => { makeDeskCard({label:"Student", x:240, y:240}); scheduleAutosave(); };
+  document.getElementById("addWindow").onclick = () => { makeIconCard({emoji:"🪟", label:"WINDOW", x:240, y:120, fill:"#c8dcff", type:"window"}); scheduleAutosave(); };
+  document.getElementById("addDoor").onclick = () => { makeIconCard({emoji:"🚪", label:"DOOR", x:240, y:260, fill:"#ffdcdc", type:"door"}); scheduleAutosave(); };
+  document.getElementById("addBoard").onclick = () => { makeIconCard({emoji:"📋", label:"BOARD", x:240, y:360, fill:"#c8ffd3", type:"board"}); scheduleAutosave(); };
+  document.getElementById("addTeacher").onclick = () => { makeIconCard({emoji:"🧑‍🏫", label:"TEACHER", x:240, y:460, fill:"#ffe6c8", type:"teacher"}); scheduleAutosave(); };
+
+  document.getElementById("bringFront").onclick = () => {
+    const n = selectedNode(); if (!n) return;
+    n.moveToTop(); tr.moveToTop(); layer.draw(); scheduleAutosave();
+  };
+  document.getElementById("sendBack").onclick = () => {
+    const n = selectedNode(); if (!n) return;
+    n.moveToBottom(); layer.draw(); scheduleAutosave();
+  };
+  document.getElementById("deleteItem").onclick = () => {
+    const n = selectedNode(); if (!n) return;
+    deselect(); n.destroy(); layer.draw(); scheduleAutosave();
+  };
+
+  document.getElementById("classSelect").addEventListener("change", (e) => switchToClass(e.target.value));
+  document.getElementById("newClass").addEventListener("click", () => {
+    const name = prompt("New class name:", "New Class"); if (!name) return;
+    const current = getActiveId(); if (current) { try { saveClass(current); } catch(e) {} }
+    const idx = loadIndex();
+    const id = uid();
+    idx.push({ id, name: String(name).trim() || "New Class" });
+    saveIndex(idx); setActiveId(id);
+    allItems().forEach(n => n.destroy());
+    ensureRoomItems();
+    saveClass(id);
+    populateClassSelect();
+  });
+  document.getElementById("renameClass").addEventListener("click", () => {
+    const idx = loadIndex();
+    const id = getActiveId();
+    const entry = idx.find(c => c.id === id);
+    if (!entry) return;
+    const next = prompt("Rename class:", entry.name); if (!next) return;
+    entry.name = String(next).trim() || entry.name;
+    saveIndex(idx); populateClassSelect();
+  });
+  document.getElementById("deleteClass").addEventListener("click", () => {
+    let idx = loadIndex();
+    const id = getActiveId();
+    if (idx.length <= 1) { alert("You need at least one class."); return; }
+    if (!confirm("Delete this class? This cannot be undone.")) return;
+    localStorage.removeItem(LS_CLASS_KEY(id));
+    idx = idx.filter(c => c.id !== id);
+    saveIndex(idx);
+    setActiveId(idx[0].id);
+    switchToClass(idx[0].id);
+  });
+
+  document.getElementById("shareLink").onclick = async () => {
+    const url = await generateShareLink();
+    document.getElementById("shareUrl").value = url;
+  };
+  document.getElementById("copyLink").onclick = async () => {
+    const val = document.getElementById("shareUrl").value;
+    if (!val) return;
+    try {
+      await navigator.clipboard.writeText(val);
+      alert("Copied!");
+    } catch(e) {
+      const box = document.getElementById("shareUrl");
+      box.focus(); box.select();
+      alert("Tap and copy the selected link.");
+    }
+  };
+
+  stage.on("click tap", (e) => { if (e.target === stage) deselect(); });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Delete" || e.key === "Backspace") {
+      const n = selectedNode(); if (!n) return;
+      deselect(); n.destroy(); layer.draw(); scheduleAutosave();
+    }
+  });
+  window.addEventListener("beforeunload", () => {
+    const id = getActiveId();
+    if (!id) return;
+    try { saveClass(id); } catch(e) {}
+  });
+
+  // ---------------- Init ----------------
+  (async function init(){
+    const imported = await importFromHashIfPresent();
+    if (imported) return;
+
+    ensureAtLeastOneClass();
+    populateClassSelect();
+    switchToClass(getActiveId());
+  })();
+</script>
+</body>
+</html>
